@@ -1,5 +1,5 @@
 
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 import gzip
 import glob
@@ -147,16 +147,12 @@ class DsmcPlusLentochkaLogs:
         self.log_manager.info(f"Session log for DSMC created at: {self.current_dsmc_session_log_file}")
     def log_lentochka_info(self, message):
         self.lentochka_logger.info(message)
-        self.log_manager.info(f"[Lentochka] {message}")
     def log_lentochka_error(self, message):
         self.lentochka_logger.error(message)
-        self.log_manager.error(f"[Lentochka] {message}")
     def log_dsmc_info(self, message):
         self.dsmc_logger.info(message)
-        self.log_manager.info(f"[DSMC] {message}")
     def log_dsmc_error(self, message):
         self.dsmc_logger.error(message)
-        self.log_manager.error(f"[DSMC] {message}")
     def append_dsmc_log_to_global(self, log_file_path):
         try:
             with open(log_file_path, 'r') as log_file:
@@ -171,17 +167,20 @@ class DsmcPlusLentochkaLogs:
             self.log_manager.error(f"Error reading DSMC log file: {e}")
             return False
     def rotate_log(self, log_file: str) -> Optional[str]:
-        max_size = 1_073_741_824  
+        max_size = 1_073_741_824
         if not os.path.exists(log_file) or os.path.getsize(log_file) < max_size:
             return None
         log_dir = os.path.dirname(log_file)
-        log_base = os.path.basename(log_file)  
+        log_base = os.path.basename(log_file)
         n = 1
         while True:
             rotated_file = os.path.join(log_dir, f"{log_base}.{n}")
             if not os.path.exists(rotated_file) and not os.path.exists(f"{rotated_file}.gz"):
                 break
             n += 1
+            if n > 1000:
+                self.log_manager.error("Infinite loop in rotate_log, too many rotated files, stopping.")
+                return None
         try:
             for handler in self.lentochka_logger.handlers:
                 if isinstance(handler, logging.FileHandler) and handler.baseFilename == os.path.abspath(log_file):
@@ -193,11 +192,10 @@ class DsmcPlusLentochkaLogs:
                     self.dsmc_logger.removeHandler(handler)
             os.rename(log_file, rotated_file)
             self.log_manager.info(f"Rotated log file: {log_file} -> {rotated_file}")
-            if "lentochka" in log_base:
-                self._setup_lentochka_logger()
-            elif "dsmc" in log_base:
-                self._setup_dsmc_logger()
             return rotated_file
+        except PermissionError as e:
+            self.log_manager.error(f"***** WARNING: PERMISSION ERROR IN ROTATE_LOG {log_file}: {e} *****")
+            return None
         except Exception as e:
             self.log_manager.error(f"Error rotating log file {log_file}: {e}")
             return None
@@ -209,13 +207,16 @@ class DsmcPlusLentochkaLogs:
             with open(rotated_file, 'rb') as f_in:
                 with gzip.open(gz_file, 'wb') as f_out:
                     while True:
-                        chunk = f_in.read(8192)  
+                        chunk = f_in.read(8192)
                         if not chunk:
                             break
                         f_out.write(chunk)
             os.remove(rotated_file)
             self.log_manager.info(f"Archived log file: {rotated_file} -> {gz_file}")
             return True
+        except PermissionError as e:
+            self.log_manager.error(f"***** WARNING: PERMISSION ERROR IN ARCHIVE_LOG {rotated_file}: {e} *****")
+            return False
         except Exception as e:
             self.log_manager.error(f"Error archiving log file {rotated_file}: {e}")
             return False
@@ -461,15 +462,31 @@ class StanzaProcessor:
                             rsync_status_count['completed'] += 1
                         else:
                             rsync_status_count['missing'] += 1
+                            stanza_name = rsync_dir.name
+                            self.lentochka_log.log_lentochka_error(
+                                f"MISSING STATUS: Repo '{repo_path}', stanza '{stanza_name}': "
+                                f"rsync.status at {rsync_status_path} has status '{status_content}' "
+                                f"(neither 'complete' nor 'failed'). "
+                                f"Action: Check if rsync process is still running, or verify file contents manually. "
+                                f"This stanza will be skipped until status becomes 'complete'."
+                            )
                 except IOError as exception:
-                    self.lentochka_log.log_lentochka_error(f"Error reading file {rsync_status_path}: {exception}")
                     rsync_status_count['missing'] += 1
+                    stanza_name = rsync_dir.name
+                    self.lentochka_log.log_lentochka_error(
+                        f"MISSING STATUS (READ ERROR): Repo '{repo_path}', stanza '{stanza_name}': "
+                        f"Failed to read rsync.status at {rsync_status_path}. "
+                        f"Error: {exception}. "
+                        f"Action: Check file permissions and ensure rsync process completed. "
+                        f"This stanza will be skipped."
+                    )
             repo_status[repo_path] = has_failed
         self.lentochka_log.log_lentochka_info(
-            f"RESULTS: Found {rsync_status_count['total']} rsync.status files, "
-            f"successfully copied: {rsync_status_count['completed']}, failed: {rsync_status_count['failed']}, "
-            f"missing: {rsync_status_count['missing']}, "
-            f"lentochka-status found: {lentochka_status_count['total']}"
+            f"RESULTS: Found {rsync_status_count['total']} rsync.status files. "
+            f"Completed (ready for tape): {rsync_status_count['completed']}, "
+            f"failed (skipped): {rsync_status_count['failed']}, "
+            f"missing/unknown status (skipped, see errors above): {rsync_status_count['missing']}. "
+            f"Already processed (lentochka-status found): {lentochka_status_count['total']}"
         )
         for repo_dir in search_root.glob('*.repo'):
             repo_path = str(repo_dir)
@@ -493,10 +510,12 @@ class StanzaProcessor:
                         if 'failed' in status_content:
                             continue
                         if 'complete' in status_content:
+                            archive_dir = repo_dir / 'archive' / rsync_dir.name
                             stanza = {
                                 'status_path': str(rsync_status_path),
                                 'repo_path': repo_path,
                                 'backup_path': str(rsync_dir),
+                                'archive_path': str(archive_dir),
                                 'status': 'completed',
                                 'lentochka_status_path': str(lentochka_status_path),
                                 'subdirs': [d.name for d in rsync_dir.iterdir() if d.is_dir()]
@@ -504,130 +523,141 @@ class StanzaProcessor:
                             stanzas.append(stanza)
                             self.lentochka_log.log_lentochka_info(
                                 f"Stanza added to processing queue: {repo_path} (at {rsync_status_path})")
+                        else:
+                            stanza_name = rsync_dir.name
+                            self.lentochka_log.log_lentochka_error(
+                                f"MISSING STATUS (SKIPPED IN QUEUE): Repo '{repo_path}', stanza '{stanza_name}': "
+                                f"rsync.status at {rsync_status_path} has status '{status_content}' "
+                                f"(not 'complete'). Skipping this stanza. "
+                                f"Action: Wait for rsync to complete or check file manually."
+                            )
                 except IOError as exception:
-                    self.lentochka_log.log_lentochka_error(f"Error reading file {rsync_status_path}: {exception}")
+                    stanza_name = rsync_dir.name
+                    self.lentochka_log.log_lentochka_error(
+                        f"MISSING STATUS (READ ERROR IN QUEUE): Repo '{repo_path}', stanza '{stanza_name}': "
+                        f"Failed to read rsync.status at {rsync_status_path}. "
+                        f"Error: {exception}. Skipping this stanza."
+                    )
         return stanzas
-    def process_stanza(self, stanza_info: Dict[str, Any]) -> bool:
+    def run_dsmc_command(self, stanza_info: Dict[str, Any], start_time: datetime.datetime) -> int:
+
+        command_str = stanza_info.get('dsmc_command', '')
+        if not command_str:
+            self.lentochka_log.log_dsmc_error("DSMC command is empty. Skipping execution.")
+            return 1
+        self.lentochka_log.log_dsmc_info(f"Executing DSMC command: {command_str}")
+        try:
+            process = subprocess.Popen(
+                command_str,
+                shell=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True
+            )
+            stdout, stderr = process.communicate()
+            if stdout:
+                for line in stdout.splitlines():
+                    self.lentochka_log.dsmc_logger.info(line)
+            if stderr:
+                for line in stderr.splitlines():
+                    self.lentochka_log.dsmc_logger.error(line)
+            self.lentochka_log.log_dsmc_info(f"DSMC command finished with code {process.returncode}")
+            return process.returncode
+        except Exception as e:
+            self.lentochka_log.log_dsmc_error(f"Error executing DSMC command: {e}")
+            return 1
+        def process_stanza(self, stanza_info: Dict[str, Any]) -> bool:
         try:
             self.lentochka_log.validate_dsmc_log_dir()
             start_time = datetime.datetime.now()
             self.lentochka_log.log_lentochka_info(
-                f"Starting to process stanza: {stanza_info['repo_path']} at {start_time} (backup: {stanza_info['backup_path']})")
+                f"Starting to process stanza: {stanza_info['repo_path']} at {start_time} "
+                f"(backup: {stanza_info['backup_path']})"
+            )
+
             backup_path = Path(stanza_info['backup_path'])
-            lentochka_status_path = Path(stanza_info['lentochka_status_path'])  
+            archive_path = Path(stanza_info.get('archive_path', '')) if stanza_info.get('archive_path') else None
+            lentochka_status_path = Path(stanza_info['lentochka_status_path'])
+
             if lentochka_status_path.exists():
                 self.lentochka_log.log_lentochka_info(
-                    f"Stanza ({stanza_info['repo_path']}) already processed, skipping (at {lentochka_status_path}).")
+                    f"Stanza already processed, skipping: {stanza_info['repo_path']}"
+                )
                 return True
+
             if not backup_path.exists():
-                self.lentochka_log.log_lentochka_error(
-                    f"Skipping stanza: Path does not exist: {backup_path}")
+                self.lentochka_log.log_lentochka_error(f"Backup path missing: {backup_path}")
                 return False
+
             if stanza_info.get('status') == 'failed':
-                self.lentochka_log.log_lentochka_info(
-                    f"Skipping stanza with failed status: {stanza_info['repo_path']}")
+                self.lentochka_log.log_lentochka_info(f"Stanza marked as failed, skipping: {stanza_info['repo_path']}")
                 return False
+
             dsmc_path = self.config.get('DSMC', 'dsmc_path', fallback='dsmc')
-            dsmc_command_template = self.config.get('DSMC', 'dsmc_command_template',
-                                                    fallback='{dsmc_path} incr {backup_dirs} -su=yes')
-            command = dsmc_command_template.format(
+            dsmc_command_template = self.config.get(
+                'DSMC',
+                'dsmc_command_template',
+                fallback='{dsmc_path} incremental "{backup_dirs}" -su=yes -se=ROV1-TSM -subdir=yes'
+            )
+
+            cmd_backup = dsmc_command_template.format(
                 dsmc_path=dsmc_path,
-                backup_dirs=str(backup_path)  
+                backup_dirs=str(backup_path) + "/"
             )
-            return_code = self.run_dsmc_command(
-                {**stanza_info, 'dsmc_command': command},
-                start_time
-            )
-            if return_code == 0:
+            self.lentochka_log.log_dsmc_info(f"DSMC BACKUP command: {cmd_backup}")
+            rc1 = self.run_dsmc_command({**stanza_info, 'dsmc_command': cmd_backup}, start_time)
+
+            rc2 = 0
+            if archive_path and archive_path.exists():
+                cmd_archive = dsmc_command_template.format(
+                    dsmc_path=dsmc_path,
+                    backup_dirs=str(archive_path) + "/"
+                )
+                self.lentochka_log.log_dsmc_info(f"DSMC ARCHIVE command: {cmd_archive}")
+                rc2 = self.run_dsmc_command({**stanza_info, 'dsmc_command': cmd_archive}, start_time)
+
+            backed_up = 0
+            log_path = self.lentochka_log.current_dsmc_session_log_file
+            if os.path.exists(log_path):
+                log_text = Path(log_path).read_text(errors='ignore')
+                for line in log_text.splitlines():
+                    if "Общее число объектов, для которых созданы резервные копии:" in line:
+                        try:
+                            backed_up += int(line.split()[-1].replace(',', ''))
+                        except:
+                            pass
+                    if "Total number of objects backed up:" in line:
+                        try:
+                            backed_up += int(line.split(':')[-1].strip())
+                        except:
+                            pass
+
+            self.lentochka_log.log_dsmc_info(f"DSMC reported backed up objects: {backed_up}")
+
+            if backed_up > 0:
                 end_time = datetime.datetime.now()
-                status_content = f"Backup written to tape\nStart: {start_time.isoformat()}\nEnd: {end_time.isoformat()}"
+                status_content = f"Backup written to tape\nStart: {start_time.isoformat()}\nEnd: {end_time.isoformat()}\nObjects: {backed_up}"
                 try:
                     with open(lentochka_status_path, 'w') as f:
                         f.write(status_content)
                     self.lentochka_log.log_lentochka_info(
-                        f"Finished processing stanza {stanza_info['repo_path']} - status: completed, file lentochka-status created at {lentochka_status_path}")
+                        f"STANZA SUCCESS: {stanza_info['repo_path']} → {backed_up} objects backed up"
+                    )
                     return True
-                except Exception as write_error:
-                    self.lentochka_log.log_lentochka_error(
-                        f"Error creating lentochka-status file: {write_error}")
+                except Exception as e:
+                    self.lentochka_log.log_lentochka_error(f"Failed to write lentochka-status: {e}")
                     return False
             else:
                 self.lentochka_log.log_lentochka_error(
-                    f"Error processing stanza {stanza_info['repo_path']} - DSMC command failed with code: {return_code}. lentochka-status NOT created.")
-                return False
-        except Exception as exception:
-            self.lentochka_log.log_lentochka_error(f"Uncaught error processing stanza: {exception}")
-            return False
-    def run_dsmc_command(self, stanza_info: Dict[str, Any], start_time: datetime.datetime) -> int:
-        log_file_path = None
-        try:
-            dsmc_log_dir = self.config.get('Logging', 'dsmc_log_dir', fallback='logs/dsmc')
-            if not os.path.exists(dsmc_log_dir):
-                os.makedirs(dsmc_log_dir)
-                self.lentochka_log.log_lentochka_info(f"Created DSMC log directory: {dsmc_log_dir}, yo")
-            stanza_path = stanza_info['repo_path']
-            stanza_name = stanza_path.replace('/', '-').replace('\\', '-').lstrip('-')
-            timestamp = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-            log_filename = f"dsmc-log-{stanza_name}-{timestamp}.log"
-            log_file_path = os.path.join(dsmc_log_dir, log_filename)
-            pid_filename = f"dsmc_{stanza_name}-{timestamp}.pid"
-            pid_file_path = os.path.join('/tmp', pid_filename)  
-            self.lentochka_log.log_lentochka_info(
-                f"Starting DSMC command at {start_time} for stanza: {stanza_info['repo_path']}")
-            self.lentochka_log.log_lentochka_info(f"DSMC log will be written to: {log_file_path}")
-            command = stanza_info['dsmc_command']
-            self.lentochka_log.log_lentochka_info(f"Executing command: {command}")
-            with open(log_file_path, 'w') as log_file:
-                process = subprocess.Popen(
-                    command,
-                    shell=True,
-                    stdout=log_file,
-                    stderr=subprocess.STDOUT
+                    f"ZERO objects backed up (rc_backup={rc1}, rc_archive={rc2}) — stanza NOT marked as done: {stanza_info['repo_path']}"
                 )
-                with open(pid_file_path, 'w') as pid_file:
-                    pid_file.write(str(process.pid))
-                self.lentochka_log.log_lentochka_info(
-                    f"DSMC started with PID {process.pid}, PID saved to {pid_filename}, yo")  
-            return 0
+                return False
+
         except Exception as e:
-            error_msg = f"Error starting DSMC command: {e}, shit happens"
-            self.lentochka_log.log_lentochka_error(error_msg)
-            if log_file_path:
-                with open(log_file_path, 'w') as error_log:
-                    error_log.write(f"CRITICAL ERROR: {error_msg}\n")
-                    error_log.write(f"Exception occurred at: {datetime.datetime.now().isoformat()}\n")
-                    error_log.write(f"Stanza path: {stanza_info['repo_path']}\n")
-                self.lentochka_log.append_dsmc_log_to_global(log_file_path)
-            return 1
-    def _check_dsmc_exists(self, dsmc_path: str) -> bool:
-        try:
-            self.lentochka_log.log_lentochka_info(f"Checking existence of DSMC at path: {dsmc_path}")
-            if os.path.isabs(dsmc_path):
-                exists = os.path.exists(dsmc_path) and os.access(dsmc_path, os.X_OK)
-                if exists:
-                    self.lentochka_log.log_lentochka_info(f"Found DSMC executable at: {dsmc_path}")
-                else:
-                    self.lentochka_log.log_lentochka_error(f"DSMC executable not found at path: {dsmc_path}")
-                return exists
-            else:
-                which_cmd = 'where' if sys.platform == 'win32' else 'which'
-                try:
-                    result = subprocess.run([which_cmd, dsmc_path],
-                                            capture_output=True,
-                                            text=True)
-                    if result.returncode == 0:
-                        dsmc_full_path = result.stdout.strip()
-                        self.lentochka_log.log_lentochka_info(f"Found DSMC in PATH at: {dsmc_full_path}")
-                        return True
-                    else:
-                        self.lentochka_log.log_lentochka_error(f"DSMC utility not found in PATH")
-                        return False
-                except Exception as which_error:
-                    self.lentochka_log.log_lentochka_error(f"Error checking DSMC with '{which_cmd}': {which_error}")
-                    return False
-        except Exception as e:
-            self.lentochka_log.log_lentochka_error(f"Error checking DSMC existence: {e}")
+            self.lentochka_log.log_lentochka_error(f"Uncaught exception in process_stanza: {e}")
             return False
+
+
 def main():
     global monitoring
     dsmc_log = None  
@@ -645,10 +675,10 @@ def main():
                     pid = int(f.read().strip())
                 os.kill(pid, 0)  
                 os.kill(pid, signal.SIGTERM)  
-                dsmc_log.log_manager.info(f"Found old DSMC process with PID {pid}, killed it, suka!")
+                dsmc_log.log_manager.info(f"Found old DSMC process with PID {pid}, terminated.")
                 os.remove(pid_file)
             except (OSError, ValueError, IOError):
-                dsmc_log.log_manager.info(f"Old PID file {pid_file} stale or invalid, removed, yo")
+                dsmc_log.log_manager.info(f"Old PID file {pid_file} is stale or invalid, removed.")
                 try:
                     os.remove(pid_file)
                 except OSError:
@@ -657,13 +687,13 @@ def main():
             if monitoring.script and not os.path.exists(monitoring.script):
                 dsmc_log.log_manager.error(f"Monitoring script not found at path: {monitoring.script}")
                 monitoring.enabled = False
-            dsmc_log.log_manager.info("Starting main script execution, hell yeah!")
+            dsmc_log.log_manager.info("Starting main script execution.")
             stanza_processor = StanzaProcessor(dsmc_log.config, dsmc_log)
             stanzas = stanza_processor.find_stanzas()
             dsmc_path = dsmc_log.config.get('DSMC', 'dsmc_path', fallback='dsmc')
             dsmc_exists = shutil.which(dsmc_path) is not None
             if not dsmc_exists:
-                error_msg = "DSMC utility not found, yo! Specify the right path in LentochkaDSMC.ini"
+                error_msg = "DSMC utility not found. Specify the correct path in LentochkaDSMC.ini"
                 dsmc_log.log_manager.error(error_msg)
                 if monitoring and monitoring.enabled:
                     try:
@@ -671,6 +701,7 @@ def main():
                     except Exception as send_error:
                         dsmc_log.log_manager.error(f"Error sending metric for dsmc not found: {send_error}")
                 sys.exit(1)
+            
             successful_copies = 0
             failed_copies = 0
             for stanza in stanzas:
@@ -702,12 +733,12 @@ def main():
             if monitoring.log_cleanup_enabled:
                 log_dir = dsmc_log.config.get('Paths', 'log_dir')
                 if not log_dir:
-                    dsmc_log.log_manager.warning("No log_dir specified, skipping cleanup, yo!")
+                    dsmc_log.log_manager.warning("No log_dir specified, skipping cleanup.")
                 else:
                     monitoring.cleanup_logs(log_dir, monitoring.log_retention_days)
-            dsmc_log.log_manager.info("Script has completed successfully, hell yeah!")
+            dsmc_log.log_manager.info("Script completed successfully.")
     except FileNotFoundError as e:
-        print(f"File not found: {e}, damn!")
+        print(f"File not found: {e}")
         if dsmc_log and hasattr(dsmc_log, 'log_manager'):
             dsmc_log.log_manager.error(f"File not found: {e}")
         if monitoring and monitoring.enabled:
@@ -718,7 +749,7 @@ def main():
                     dsmc_log.log_manager.error(f"Error sending metric for FileNotFoundError: {send_error}")
         sys.exit(1)
     except ValueError as e:
-        print(f"Value error: {e}, shit!")
+        print(f"Value error: {e}")
         if dsmc_log and hasattr(dsmc_log, 'log_manager'):
             dsmc_log.log_manager.error(f"Value error: {e}")
         if monitoring and monitoring.enabled:
@@ -729,7 +760,7 @@ def main():
                     dsmc_log.log_manager.error(f"Error sending metric for ValueError: {send_error}")
         sys.exit(1)
     except Exception as e:
-        print(f"Unexpected error: {e}, yo!")
+        print(f"Unexpected error: {e}")
         if dsmc_log and hasattr(dsmc_log, 'log_manager'):
             dsmc_log.log_manager.error(f"Unexpected error: {e}")
         if monitoring and monitoring.enabled:
